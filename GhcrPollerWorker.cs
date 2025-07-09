@@ -293,6 +293,18 @@ public class GhcrPollerWorker : BackgroundService
         }
     }
 
+    private static async Task<bool> PollUntilAsync(Func<Task<bool>> condition, TimeSpan interval, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var start = DateTime.UtcNow;
+        while ((DateTime.UtcNow - start) < timeout && !cancellationToken.IsCancellationRequested)
+        {
+            if (await condition())
+                return true;
+            await Task.Delay(interval, cancellationToken);
+        }
+        return false;
+    }
+
     private async Task UpdateService(SwarmService service, string imageName, string tag, string digest, CancellationToken stoppingToken)
     {
         try
@@ -323,17 +335,13 @@ public class GhcrPollerWorker : BackgroundService
             _logger.LogInformation("Successfully updated service {ServiceName}", service.Spec.Name);
 
             // Post-update: poll for up to 30 seconds, checking every 2 seconds if digest is running
-            var timeout = TimeSpan.FromSeconds(30);
-            var interval = TimeSpan.FromSeconds(2);
-            var start = DateTime.UtcNow;
-            bool isRunning = false;
-            while ((DateTime.UtcNow - start) < timeout && !stoppingToken.IsCancellationRequested)
-            {
-                isRunning = await IsDigestRunning(service, digest, stoppingToken);
-                if (isRunning)
-                    break;
-                await Task.Delay(interval, stoppingToken);
-            }
+            bool isRunning = await PollUntilAsync(
+                 () => IsDigestRunning(service, digest, stoppingToken),
+                 TimeSpan.FromSeconds(2),
+                 TimeSpan.FromSeconds(30),
+                 stoppingToken
+             );
+            _logger.LogInformation("Post-update check for service {ServiceName} with digest {Digest}: {IsRunning}", service.Spec.Name, digest, isRunning ? "running" : "not running");
 
             if (!isRunning)
             {
