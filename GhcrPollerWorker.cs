@@ -1,10 +1,9 @@
 
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Docker.DotNet; // Add this for DockerClient
+using Docker.DotNet;
 using Docker.DotNet.Models;
 using System.Net.Http.Headers;
-using System.Linq;
 
 public class GhcrPollerWorker : BackgroundService
 {
@@ -135,7 +134,7 @@ public class GhcrPollerWorker : BackgroundService
         var parts = image.Split("@sha256:", StringSplitOptions.TrimEntries);
         var imageWithTag = parts[0];
         var digest = parts.Length > 1 ? $"sha256:{parts[1]}" : null;
-        
+
         // Split image name and tag
         var tagSeparatorIndex = imageWithTag.LastIndexOf(':');
         if (tagSeparatorIndex == -1)
@@ -143,10 +142,10 @@ public class GhcrPollerWorker : BackgroundService
             // No tag specified, assume 'latest'
             return (imageWithTag, "latest", digest);
         }
-        
+
         var imageName = imageWithTag[..tagSeparatorIndex];
         var tag = imageWithTag[(tagSeparatorIndex + 1)..];
-        
+
         return (imageName, tag, digest);
     }
 
