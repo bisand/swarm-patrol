@@ -8,6 +8,8 @@ public class GhcrPollerWorker : BackgroundService
 {
     private readonly ILogger<GhcrPollerWorker> _logger;
     private readonly DockerClient _docker;
+    private readonly string _ghcrOwner;
+    private readonly string _ghcrUsername;
     private readonly string _ghcrToken;
     private readonly int _interval;
 
@@ -15,8 +17,18 @@ public class GhcrPollerWorker : BackgroundService
     {
         _logger = logger;
         _docker = docker;
+        _ghcrOwner = Environment.GetEnvironmentVariable("GHCR_OWNER") ?? throw new("Missing GHCR_OWNER");
+        _ghcrUsername = Environment.GetEnvironmentVariable("GHCR_USERNAME") ?? throw new("Missing GHCR_USERNAME");
         _ghcrToken = Environment.GetEnvironmentVariable("GHCR_TOKEN") ?? throw new("Missing GHCR_TOKEN");
         _interval = int.TryParse(Environment.GetEnvironmentVariable("POLL_INTERVAL"), out var i) ? i : 300;
+
+        _logger.LogInformation("Ensure environment variables are set: GHCR_OWNER, GHCR_USERNAME, GHCR_TOKEN, POLL_INTERVAL");
+        // Scramble token for logging (show only first 3 and last 3 chars)
+        string scrambledToken = _ghcrToken.Length > 6
+            ? $"{_ghcrToken.Substring(0, 3)}***{_ghcrToken.Substring(_ghcrToken.Length - 3)}"
+            : "***";
+        _logger.LogInformation("GHCR Poller initialized with owner: {Owner}, username: {Username}, token: {Token}, interval: {Interval} seconds",
+            _ghcrOwner, _ghcrUsername, scrambledToken, _interval);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -74,7 +86,7 @@ public class GhcrPollerWorker : BackgroundService
         foreach (var service in services)
         {
             var image = service.Spec.TaskTemplate.ContainerSpec.Image;
-            if (image is null || !image.Contains("ghcr.io/valueretail", StringComparison.InvariantCultureIgnoreCase))
+            if (image is null || !image.Contains($"ghcr.io/{_ghcrOwner}", StringComparison.InvariantCultureIgnoreCase))
                 continue;
 
             _logger.LogInformation("Checking service {ServiceName} with image: {Image}", service.Spec.Name, image);
@@ -113,7 +125,7 @@ public class GhcrPollerWorker : BackgroundService
         foreach (var container in containers)
         {
             var image = container.Image;
-            if (image is null || !image.Contains("ghcr.io/valueretail", StringComparison.InvariantCultureIgnoreCase))
+            if (image is null || !image.Contains($"ghcr.io/{_ghcrOwner}", StringComparison.InvariantCultureIgnoreCase))
                 continue;
 
             var (imageName, tag, currentDigest) = ParseImage(image);
@@ -246,7 +258,7 @@ public class GhcrPollerWorker : BackgroundService
                 StartInfo = new System.Diagnostics.ProcessStartInfo
                 {
                     FileName = "docker",
-                    Arguments = "login ghcr.io -u valueretail --password-stdin",
+                    Arguments = $"login ghcr.io -u {_ghcrUsername} --password-stdin",
                     UseShellExecute = false,
                     RedirectStandardInput = true,
                     RedirectStandardOutput = true,
@@ -283,7 +295,7 @@ public class GhcrPollerWorker : BackgroundService
             var imageSpec = $"{imageName}:{tag}";
             _logger.LogInformation("Pulling image {ImageSpec} before service update", imageSpec);
             var pullParams = new ImagesCreateParameters { FromImage = imageName, Tag = tag };
-            var authConfig = new AuthConfig { ServerAddress = "https://ghcr.io", Username = "valueretail", Password = _ghcrToken };
+            var authConfig = new AuthConfig { ServerAddress = "https://ghcr.io", Username = _ghcrUsername, Password = _ghcrToken };
             await _docker.Images.CreateImageAsync(pullParams, authConfig, new Progress<JSONMessage>(), stoppingToken);
             _logger.LogInformation("Successfully pulled image {ImageSpec}", imageSpec);
         }
