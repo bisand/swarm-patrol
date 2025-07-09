@@ -1,4 +1,3 @@
-
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Docker.DotNet;
@@ -27,6 +26,9 @@ public class GhcrPollerWorker : BackgroundService
         // Check if Docker is in Swarm mode
         bool isSwarmMode = await IsSwarmModeAsync();
         _logger.LogInformation("Docker Swarm mode: {IsSwarmMode}", isSwarmMode);
+
+        // Ensure Docker is logged into GHCR
+        await EnsureDockerLoginAsync();
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -72,31 +74,34 @@ public class GhcrPollerWorker : BackgroundService
         foreach (var service in services)
         {
             var image = service.Spec.TaskTemplate.ContainerSpec.Image;
-            if (image is null || !image.Contains("ghcr.io/valueretail", StringComparison.InvariantCultureIgnoreCase)) continue;
+            if (image is null || !image.Contains("ghcr.io/valueretail", StringComparison.InvariantCultureIgnoreCase))
+                continue;
+
+            _logger.LogInformation("Checking service {ServiceName} with image: {Image}", service.Spec.Name, image);
 
             var (imageName, tag, currentDigest) = ParseImage(image);
-            var latestDigest = await GetDigestFromGHCR(imageName, tag);
+            var latestDigest = await GetLatestDigestFromGHCR(imageName, tag);
 
+            _logger.LogInformation("Service {ServiceName}: Current={CurrentDigest}, Latest={LatestDigest}",
+                service.Spec.Name, currentDigest ?? "none", latestDigest);
+
+            // Update if digests are different
             if (currentDigest != latestDigest)
             {
-                _logger.LogInformation("Updating service {ServiceName} to digest {Digest}", service.Spec.Name, latestDigest);
-                service.Spec.TaskTemplate.ContainerSpec.Image = $"{imageName}:{tag}@{latestDigest}";
-                var parameters = new ServiceUpdateParameters
-                {
-                    Version = (long)service.Version.Index,
-                    Service = service.Spec,
-                    RegistryAuthFrom = "spec",
-                    RegistryAuth = new AuthConfig
-                    {
-                        ServerAddress = "https://ghcr.io",
-                        IdentityToken = _ghcrToken
-                    }
-                };
-                await _docker.Swarm.UpdateServiceAsync(service.ID, parameters, stoppingToken);
+                _logger.LogInformation("Updating service {ServiceName}: {CurrentDigest} -> {LatestDigest}",
+                    service.Spec.Name, currentDigest ?? "none", latestDigest);
+
+                await UpdateService(service, imageName, tag, latestDigest, stoppingToken);
             }
             else
             {
                 _logger.LogInformation("No update needed for service {ServiceName}", service.Spec.Name);
+                var isRunning = await IsDigestRunning(service, latestDigest, stoppingToken);
+                if (!isRunning)
+                {
+                    _logger.LogWarning("Service {ServiceName} is not running the latest digest {LatestDigest}. Please check manually.",
+                        service.Spec.Name, latestDigest);
+                }
             }
         }
     }
@@ -108,10 +113,11 @@ public class GhcrPollerWorker : BackgroundService
         foreach (var container in containers)
         {
             var image = container.Image;
-            if (image is null || !image.Contains("ghcr.io/valueretail", StringComparison.InvariantCultureIgnoreCase)) continue;
+            if (image is null || !image.Contains("ghcr.io/valueretail", StringComparison.InvariantCultureIgnoreCase))
+                continue;
 
             var (imageName, tag, currentDigest) = ParseImage(image);
-            var latestDigest = await GetDigestFromGHCR(imageName, tag);
+            var latestDigest = await GetLatestDigestFromGHCR(imageName, tag);
 
             if (currentDigest != latestDigest)
             {
@@ -119,7 +125,6 @@ public class GhcrPollerWorker : BackgroundService
                     container.Names?.FirstOrDefault() ?? container.ID[..12], currentDigest, latestDigest);
                 _logger.LogWarning("Automatic container updates not implemented yet. Please manually update container {ContainerName}",
                     container.Names?.FirstOrDefault() ?? container.ID[..12]);
-                // TODO: Implement container recreation logic
             }
             else
             {
@@ -131,15 +136,15 @@ public class GhcrPollerWorker : BackgroundService
 
     private static (string imageName, string tag, string? digest) ParseImage(string image)
     {
+        // Handle digest format: image:tag@sha256:digest
         var parts = image.Split("@sha256:", StringSplitOptions.TrimEntries);
         var imageWithTag = parts[0];
         var digest = parts.Length > 1 ? $"sha256:{parts[1]}" : null;
 
-        // Split image name and tag
+        // Handle tag format: image:tag
         var tagSeparatorIndex = imageWithTag.LastIndexOf(':');
         if (tagSeparatorIndex == -1)
         {
-            // No tag specified, assume 'latest'
             return (imageWithTag, "latest", digest);
         }
 
@@ -149,84 +154,239 @@ public class GhcrPollerWorker : BackgroundService
         return (imageName, tag, digest);
     }
 
-    private async Task<string> GetDigestFromGHCR(string image, string tag)
+    private async Task<string> GetLatestDigestFromGHCR(string image, string tag)
     {
         var parts = image.Replace("ghcr.io/", "").Split("/", 2);
         var owner = parts[0];
         var repo = parts.Length > 1 ? parts[1] : throw new ArgumentException("Invalid image format", nameof(image));
-        var scope = $"repository:{owner}/{repo}:pull";
-
-        _logger.LogDebug("Fetching digest for {Image}:{Tag}", image, tag);
 
         using var client = new HttpClient();
 
         try
         {
-            // Step 1: Get Bearer token from GHCR using GitHub PAT
-            string bearerToken;
-            if (_ghcrToken.StartsWith("ghp_"))
-            {
-                bearerToken = await GetGhcrBearerToken(client, scope, owner);
-            }
-            else
-            {
-                bearerToken = _ghcrToken; // Assume it's already a bearer token
-            }
+            // Get bearer token
+            var bearerToken = await GetGhcrBearerToken(client, owner, repo);
 
-            // Step 2: Use Bearer token to get manifest
+            // Get manifest digest using HEAD request
             var manifestUrl = $"https://ghcr.io/v2/{owner}/{repo}/manifests/{tag}";
             client.DefaultRequestHeaders.Clear();
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.oci.image.manifest.v1+json"));
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
 
-            using var resp = await client.GetAsync(manifestUrl);
-
-            if (!resp.IsSuccessStatusCode)
-            {
-                var errorContent = await resp.Content.ReadAsStringAsync();
-                _logger.LogError("GHCR manifest request failed. Status: {StatusCode}, Response: {Response}",
-                    resp.StatusCode, errorContent);
-                resp.EnsureSuccessStatusCode();
-            }
+            using var resp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, manifestUrl));
+            resp.EnsureSuccessStatusCode();
 
             var digest = resp.Headers.GetValues("Docker-Content-Digest").First();
-            _logger.LogDebug("Retrieved digest {Digest} for image {Image}:{Tag}", digest, image, tag);
+            _logger.LogDebug("Got digest {Digest} for {Image}:{Tag}", digest, image, tag);
+
+            // Validate the digest exists by making another HEAD request to the digest URL
+            await ValidateDigestExists(client, owner, repo, digest, bearerToken);
+
             return digest;
         }
-        catch (HttpRequestException ex)
+        catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to fetch digest for image {Image}:{Tag} from GHCR", image, tag);
+            _logger.LogError(ex, "Failed to fetch digest for {Image}:{Tag}", image, tag);
             throw;
         }
     }
 
-    private async Task<string> GetGhcrBearerToken(HttpClient client, string scope, string owner)
+    private async Task ValidateDigestExists(HttpClient client, string owner, string repo, string digest, string bearerToken)
     {
+        try
+        {
+            var digestUrl = $"https://ghcr.io/v2/{owner}/{repo}/manifests/{digest}";
+            client.DefaultRequestHeaders.Clear();
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.oci.image.manifest.v1+json"));
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+
+            using var resp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, digestUrl));
+            if (!resp.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException($"Digest {digest} does not exist in registry for {owner}/{repo}. Status: {resp.StatusCode}");
+            }
+
+            _logger.LogDebug("Validated digest {Digest} exists for {Owner}/{Repo}", digest, owner, repo);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to validate digest {Digest} for {Owner}/{Repo}", digest, owner, repo);
+            throw;
+        }
+    }
+
+    private async Task<string> GetGhcrBearerToken(HttpClient client, string owner, string repo)
+    {
+        var scope = $"repository:{owner}/{repo}:pull";
         var tokenUrl = $"https://ghcr.io/token?scope={Uri.EscapeDataString(scope)}&service=ghcr.io";
 
-        // Use Basic auth with GitHub PAT to get GHCR bearer token
+        // Use Basic auth with GitHub PAT
         var basicAuth = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"{owner}:{_ghcrToken}"));
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", basicAuth);
 
-        _logger.LogDebug("Getting GHCR bearer token for scope: {Scope}", scope);
-
         using var tokenResp = await client.GetAsync(tokenUrl);
-        if (!tokenResp.IsSuccessStatusCode)
-        {
-            var errorContent = await tokenResp.Content.ReadAsStringAsync();
-            _logger.LogError("Failed to get GHCR token. Status: {StatusCode}, Response: {Response}",
-                tokenResp.StatusCode, errorContent);
-            tokenResp.EnsureSuccessStatusCode();
-        }
+        tokenResp.EnsureSuccessStatusCode();
 
         var tokenJson = await tokenResp.Content.ReadAsStringAsync();
 
-        // Parse the token from JSON response
+        // Simple JSON parsing - find the token value
         var tokenStart = tokenJson.IndexOf("\"token\":\"") + 9;
         var tokenEnd = tokenJson.IndexOf("\"", tokenStart);
-        var token = tokenJson[tokenStart..tokenEnd];
+        return tokenJson[tokenStart..tokenEnd];
+    }
 
-        _logger.LogDebug("Successfully obtained GHCR bearer token");
-        return token;
+    private async Task EnsureDockerLoginAsync()
+    {
+        try
+        {
+            _logger.LogInformation("Logging Docker into GHCR");
+
+            var loginProcess = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "docker",
+                    Arguments = "login ghcr.io -u valueretail --password-stdin",
+                    UseShellExecute = false,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+
+            loginProcess.Start();
+            await loginProcess.StandardInput.WriteLineAsync(_ghcrToken);
+            loginProcess.StandardInput.Close();
+            await loginProcess.WaitForExitAsync();
+
+            if (loginProcess.ExitCode == 0)
+            {
+                _logger.LogInformation("Successfully logged Docker into GHCR");
+            }
+            else
+            {
+                var error = await loginProcess.StandardError.ReadToEndAsync();
+                _logger.LogWarning("Docker login failed: {Error}", error);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to login Docker to GHCR");
+        }
+    }
+
+    private async Task PullImageAsync(string imageName, string tag, CancellationToken stoppingToken)
+    {
+        try
+        {
+            var imageSpec = $"{imageName}:{tag}";
+            _logger.LogInformation("Pulling image {ImageSpec} before service update", imageSpec);
+            var pullParams = new ImagesCreateParameters { FromImage = imageName, Tag = tag };
+            var authConfig = new AuthConfig { ServerAddress = "https://ghcr.io", Username = "valueretail", Password = _ghcrToken };
+            await _docker.Images.CreateImageAsync(pullParams, authConfig, new Progress<JSONMessage>(), stoppingToken);
+            _logger.LogInformation("Successfully pulled image {ImageSpec}", imageSpec);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to pull image {ImageName}:{Tag} before update", imageName, tag);
+        }
+    }
+
+    private async Task UpdateService(SwarmService service, string imageName, string tag, string digest, CancellationToken stoppingToken)
+    {
+        try
+        {
+            await PullImageAsync(imageName, tag, stoppingToken);
+
+            _logger.LogInformation("Updating service {ServiceName} to {ImageName}:{Tag}@{Digest}",
+                service.Spec.Name, imageName, tag, digest[..16] + "...");
+
+            // Update the service spec with the new digest
+            service.Spec.TaskTemplate.ContainerSpec.Image = $"{imageName}:{tag}@{digest}";
+
+            // Add a timestamp label to force update
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+            if (service.Spec.TaskTemplate.ContainerSpec.Labels == null)
+            {
+                service.Spec.TaskTemplate.ContainerSpec.Labels = new Dictionary<string, string>();
+            }
+            service.Spec.TaskTemplate.ContainerSpec.Labels["swarm-patrol.updated"] = timestamp;
+
+            var parameters = new ServiceUpdateParameters
+            {
+                Version = (long)service.Version.Index,
+                Service = service.Spec
+            };
+
+            await _docker.Swarm.UpdateServiceAsync(service.ID, parameters, stoppingToken);
+            _logger.LogInformation("Successfully updated service {ServiceName}", service.Spec.Name);
+
+            // Post-update: poll for up to 30 seconds, checking every 2 seconds if digest is running
+            var timeout = TimeSpan.FromSeconds(30);
+            var interval = TimeSpan.FromSeconds(2);
+            var start = DateTime.UtcNow;
+            bool isRunning = false;
+            while ((DateTime.UtcNow - start) < timeout && !stoppingToken.IsCancellationRequested)
+            {
+                isRunning = await IsDigestRunning(service, digest, stoppingToken);
+                if (isRunning)
+                    break;
+                await Task.Delay(interval, stoppingToken);
+            }
+
+            if (!isRunning)
+            {
+                _logger.LogWarning("Digest {Digest} is not running after update for service {ServiceName} (timed out after 30s). Falling back to tag only.", digest, service.Spec.Name);
+                service.Spec.TaskTemplate.ContainerSpec.Image = $"{imageName}:{tag}";
+                var fallbackParameters = new ServiceUpdateParameters
+                {
+                    Version = (long)service.Version.Index,
+                    Service = service.Spec
+                };
+                await _docker.Swarm.UpdateServiceAsync(service.ID, fallbackParameters, stoppingToken);
+                _logger.LogInformation("Fallback to tag-only update for service {ServiceName}", service.Spec.Name);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update service {ServiceName} with digest {Digest}. Will retry without digest.",
+                service.Spec.Name, digest);
+
+            // Fallback: try updating with just the tag if digest update fails
+            try
+            {
+                _logger.LogInformation("Attempting fallback update for service {ServiceName} using tag only", service.Spec.Name);
+
+                service.Spec.TaskTemplate.ContainerSpec.Image = $"{imageName}:{tag}";
+                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+                if (service.Spec.TaskTemplate.ContainerSpec.Labels == null)
+                {
+                    service.Spec.TaskTemplate.ContainerSpec.Labels = new Dictionary<string, string>();
+                }
+                service.Spec.TaskTemplate.ContainerSpec.Labels["swarm-patrol.fallback"] = timestamp;
+
+                var fallbackParameters = new ServiceUpdateParameters
+                {
+                    Version = (long)service.Version.Index,
+                    Service = service.Spec
+                };
+
+                await _docker.Swarm.UpdateServiceAsync(service.ID, fallbackParameters, stoppingToken);
+                _logger.LogInformation("Successfully updated service {ServiceName} using fallback method", service.Spec.Name);
+            }
+            catch (Exception fallbackEx)
+            {
+                _logger.LogError(fallbackEx, "Fallback update also failed for service {ServiceName}", service.Spec.Name);
+                throw;
+            }
+        }
+    }
+
+    private async Task<bool> IsDigestRunning(SwarmService service, string digest, CancellationToken stoppingToken)
+    {
+        // Wait a few seconds for tasks to start
+        var tasks = await _docker.Tasks.ListAsync(new TasksListParameters { Filters = new Dictionary<string, IDictionary<string, bool>> { ["service"] = new Dictionary<string, bool> { [service.Spec.Name] = true } } });
+        return tasks.Any(t => t.Status?.State == TaskState.Running && t.Spec.ContainerSpec?.Image?.Contains(digest) == true);
     }
 }
