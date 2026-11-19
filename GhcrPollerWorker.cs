@@ -91,29 +91,38 @@ public class GhcrPollerWorker : BackgroundService
 
             _logger.LogInformation("Checking service {ServiceName} with image: {Image}", service.Spec.Name, image);
 
-            var (imageName, tag, currentDigest) = ParseImage(image);
-            var latestDigest = await GetLatestDigestFromGHCR(imageName, tag);
-
-            _logger.LogInformation("Service {ServiceName}: Current={CurrentDigest}, Latest={LatestDigest}",
-                service.Spec.Name, currentDigest ?? "none", latestDigest);
-
-            // Update if digests are different
-            if (currentDigest != latestDigest)
+            // One failing service (for example an image missing from GHCR) must not stop the
+            // services after it from being checked in this pass.
+            try
             {
-                _logger.LogInformation("Updating service {ServiceName}: {CurrentDigest} -> {LatestDigest}",
+                var (imageName, tag, currentDigest) = ParseImage(image);
+                var latestDigest = await GetLatestDigestFromGHCR(imageName, tag);
+
+                _logger.LogInformation("Service {ServiceName}: Current={CurrentDigest}, Latest={LatestDigest}",
                     service.Spec.Name, currentDigest ?? "none", latestDigest);
 
-                await UpdateService(service, imageName, tag, latestDigest, stoppingToken);
-            }
-            else
-            {
-                _logger.LogInformation("No update needed for service {ServiceName}", service.Spec.Name);
-                var isRunning = await IsDigestRunning(service, latestDigest, stoppingToken);
-                if (!isRunning)
+                // Update if digests are different
+                if (currentDigest != latestDigest)
                 {
-                    _logger.LogWarning("Service {ServiceName} is not running the latest digest {LatestDigest}. Please check manually.",
-                        service.Spec.Name, latestDigest);
+                    _logger.LogInformation("Updating service {ServiceName}: {CurrentDigest} -> {LatestDigest}",
+                        service.Spec.Name, currentDigest ?? "none", latestDigest);
+
+                    await UpdateService(service, imageName, tag, latestDigest, stoppingToken);
                 }
+                else
+                {
+                    _logger.LogInformation("No update needed for service {ServiceName}", service.Spec.Name);
+                    var isRunning = await IsDigestRunning(service, latestDigest, stoppingToken);
+                    if (!isRunning)
+                    {
+                        _logger.LogWarning("Service {ServiceName} is not running the latest digest {LatestDigest}. Please check manually.",
+                            service.Spec.Name, latestDigest);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Skipping service {ServiceName} in this pass", service.Spec.Name);
             }
         }
     }
@@ -128,20 +137,27 @@ public class GhcrPollerWorker : BackgroundService
             if (image is null || !image.Contains($"ghcr.io/{_ghcrOwner}", StringComparison.InvariantCultureIgnoreCase))
                 continue;
 
-            var (imageName, tag, currentDigest) = ParseImage(image);
-            var latestDigest = await GetLatestDigestFromGHCR(imageName, tag);
+            var name = container.Names?.FirstOrDefault() ?? container.ID[..12];
+            try
+            {
+                var (imageName, tag, currentDigest) = ParseImage(image);
+                var latestDigest = await GetLatestDigestFromGHCR(imageName, tag);
 
-            if (currentDigest != latestDigest)
-            {
-                _logger.LogInformation("Container {ContainerName} has updates available. Current: {CurrentDigest}, Latest: {LatestDigest}",
-                    container.Names?.FirstOrDefault() ?? container.ID[..12], currentDigest, latestDigest);
-                _logger.LogWarning("Automatic container updates not implemented yet. Please manually update container {ContainerName}",
-                    container.Names?.FirstOrDefault() ?? container.ID[..12]);
+                if (currentDigest != latestDigest)
+                {
+                    _logger.LogInformation("Container {ContainerName} has updates available. Current: {CurrentDigest}, Latest: {LatestDigest}",
+                        name, currentDigest, latestDigest);
+                    _logger.LogWarning("Automatic container updates not implemented yet. Please manually update container {ContainerName}",
+                        name);
+                }
+                else
+                {
+                    _logger.LogInformation("No update needed for container {ContainerName}", name);
+                }
             }
-            else
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogInformation("No update needed for container {ContainerName}",
-                    container.Names?.FirstOrDefault() ?? container.ID[..12]);
+                _logger.LogError(ex, "Skipping container {ContainerName} in this pass", name);
             }
         }
     }
